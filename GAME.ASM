@@ -1,0 +1,1325 @@
+; ============================================================================
+; GAME.ASM  -  NEON SMASH Game Engine
+; [Iter1] Game screen layout (ball, paddle, bricks, HUD)
+; [Iter2] Full Level 1 gameplay (input, physics, collisions, lives, game loop)
+; [Iter3] Multi-level system (3 levels), level transitions, win/game-over flow
+; [Iter3/Bonus] Mouse support, pause system, sound effects
+; ============================================================================
+
+.DATA
+
+; [Iter1] HUD Strings (displayed at top of game screen)
+HudScore        DB 'SCORE: 0000', 0
+HudLives        DB 'LIVES: 3', 0
+HudLevel        DB 'LVL: 1', 0
+
+; [Iter2] Runtime game state - ball physics
+BALL_POS_X      DW 158
+BALL_POS_Y      DW 181
+BALL_DX         DW 2
+BALL_DY         DW -2
+BALL_SIZE_W     DW 4
+BALL_SIZE_H     DW 4
+
+; [Iter2] Paddle state
+PADDLE_POS_X    DW 135
+PADDLE_PREV_X   DW 135
+PADDLE_POS_Y    DW 185
+PADDLE_WIDTH    DW 50
+PADDLE_HEIGHT   DW 5
+PADDLE_STEP     DW 4
+
+; [Iter1] Brick grid layout (max 56 bricks = 14 cols x 4 rows)
+; [Iter2] BRICK_ALIVE tracks which bricks are still standing
+BRICK_ALIVE     DB 56 DUP(1)
+BRICK_GRID_W    DW 18
+BRICK_GRID_H    DW 8
+BRICK_GRID_GAP  DW 2
+BRICK_STEP_X    DW 20
+BRICK_STEP_Y    DW 10
+BRICK_COLS      DW 14
+BRICK_ROWS      DW 4
+BRICK_MARGIN_X  DW 20
+BRICK_START_Y   DW 25
+
+; [Iter2] Scoring / state variables
+PLAYER_SCORE    DW 0
+PLAYER_LIVES    DB 3
+CURRENT_LEVEL   DB 1            ; [Iter3] Current level (1-3)
+GAME_STATE      DB 0            ; [Iter2] 0=playing, 1=game over, 2=win
+GAME_RUNNING    DB 1
+GAME_STARTED    DB 0
+GAME_PAUSED     DB 0            ; [Iter3/Bonus] 1=paused
+MOUSE_ACTIVE    DB 0            ; [Iter3/Bonus] 1=mouse driver detected
+MOUSE_PREV_X    DW 160
+
+; HUD cache
+HUD_SCORE_CACHED    DW 0
+HUD_LIVES_CACHED    DB 3
+HUD_UPDATE_FLAG     DB 1
+
+COLLISION_TYPE      DB 0
+COLLISION_BRICK_IDX DB 0
+
+; Brick loop variables
+BRICK_ROW       DB 0
+BRICK_COL       DB 0
+BRICK_CLR       DB 0
+BRICK_X         DW 0
+BRICK_Y         DW 0
+
+; [Iter2] Brick row colors for Level 1
+; [Iter3] Added Level 2 and Level 3 color palettes
+BrickColorsL1   DB 04h, 06h, 0Eh, 02h   ; Red/Orange/Yellow/Green
+BrickColorsL2   DB 0Dh, 0Bh, 0Eh, 04h   ; Magenta/Cyan/Yellow/Red
+BrickColorsL3   DB 0Fh, 0Bh, 0Dh, 0Eh   ; White/Cyan/Magenta/Yellow
+
+; Pointer to active color table (offset inside DS)
+BrickColorPtr   DW OFFSET BrickColorsL1
+
+; Layout constant
+C_HUD_SEP       EQU 08h
+HUD_SEP_Y       DW 15
+
+
+
+; [Iter3] Level speed table (DX, DY) - increases per level
+LevelSpeedDX    DW 2, 3, 4
+LevelSpeedDY    DW -2, -3, -4
+
+; [Iter2] Brick layout table for Level 1 (56 bytes, 0=empty 1=alive)
+LayoutL1  DB 1,1,1,1,1,1,1,1,1,1,1,1,1,1
+          DB 1,1,1,1,1,1,1,1,1,1,1,1,1,1
+          DB 1,1,1,1,1,1,1,1,1,1,1,1,1,1
+          DB 1,1,1,1,1,1,1,1,1,1,1,1,1,1
+
+; [Iter3] Level 2: Checkerboard pattern (alternating bricks)
+LayoutL2  DB 1,0,1,0,1,0,1,0,1,0,1,0,1,0
+          DB 0,1,0,1,0,1,0,1,0,1,0,1,0,1
+          DB 1,0,1,0,1,0,1,0,1,0,1,0,1,0
+          DB 0,1,0,1,0,1,0,1,0,1,0,1,0,1
+
+; [Iter3] Level 3: Diamond / fortress pattern
+LayoutL3  DB 0,0,1,1,1,1,1,1,1,1,1,1,0,0
+          DB 0,1,0,0,1,1,1,1,1,1,0,0,1,0
+          DB 1,1,1,1,1,1,1,1,1,1,1,1,1,1
+          DB 0,0,1,1,1,1,1,1,1,1,1,1,0,0
+
+; [Iter3] Pointer to active layout
+LayoutPtr       DW OFFSET LayoutL1
+
+; [Iter2] Screen messages
+MsgGameOver     DB 'GAME OVER', 0
+MsgYouWin       DB 'YOU WIN!', 0          ; [Iter3]
+MsgPressKey     DB 'Press any key...', 0
+MsgLevel2       DB 'LEVEL 2 - FASTER!', 0   ; [Iter3]
+MsgLevel3       DB 'LEVEL 3 - MAX SPEED!', 0 ; [Iter3]
+MsgPaused       DB 'GAME PAUSED', 0        ; [Iter3/Bonus]
+MsgResume       DB '[R] Resume', 0          ; [Iter3/Bonus]
+MsgQuit         DB '[Q] Quit to Menu', 0    ; [Iter3/Bonus]
+
+
+.CODE
+
+
+; [Iter2] SHOW_GAME_SCREEN - Entry point called from MAIN (HOMENEON.ASM)
+; [Iter3] Now supports starting at any level via SELECTED_LEVEL
+SHOW_GAME_SCREEN PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+
+    CALL INIT_GAME
+
+    CALL DRAW_STATIC_LAYOUT
+
+    CALL GAME_LOOP
+
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+SHOW_GAME_SCREEN ENDP
+
+
+; [Iter2] INIT_GAME - Full reset (called once at game start)
+; [Iter3] Uses SELECTED_LEVEL from level selection screen
+INIT_GAME PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+
+    CALL CHECK_EXISTING_USER
+    MOV BYTE PTR PLAYER_LIVES, 3
+    ; Use SELECTED_LEVEL from level selection screen (1, 2, or 3)
+    MOV AL, BYTE PTR SELECTED_LEVEL
+    MOV BYTE PTR CURRENT_LEVEL, AL
+
+    CALL SET_LEVEL_CONFIG
+
+    MOV WORD PTR HUD_SCORE_CACHED, 0FFFFh
+    MOV BYTE PTR HUD_LIVES_CACHED, 0FFh
+
+    MOV BYTE PTR BONUS_ACTIVE, 0
+    MOV BYTE PTR BONUS_TYPE, 0
+    MOV BYTE PTR BONUS_EFFECT, 0
+    MOV WORD PTR BONUS_TIMER, 0
+
+    PUSH DX
+    MOV AH, 00h
+    INT 1Ah
+    MOV WORD PTR RNG_SEED, DX
+    POP DX
+
+    CALL INIT_MOUSE
+
+    POP CX
+    POP BX
+    POP AX
+    RET
+INIT_GAME ENDP
+
+
+; INIT_MOUSE  - Detect and initialize INT 33h mouse driver
+INIT_MOUSE PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+
+    MOV AX, 0000h
+    INT 33h
+    CMP AX, 0FFFFh
+    JNE @@IM_NO_MOUSE
+
+    MOV BYTE PTR MOUSE_ACTIVE, 1
+
+    MOV AX, 0007h
+    XOR CX, CX
+    MOV DX, 639
+    INT 33h
+
+    MOV AX, 0008h
+    XOR CX, CX
+    MOV DX, 199
+    INT 33h
+
+    MOV AX, 0004h
+    MOV CX, 320
+    MOV DX, 185
+    INT 33h
+
+    MOV WORD PTR MOUSE_PREV_X, 160
+    JMP @@IM_DONE
+
+@@IM_NO_MOUSE:
+    MOV BYTE PTR MOUSE_ACTIVE, 0
+
+@@IM_DONE:
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+INIT_MOUSE ENDP
+
+
+; [Iter3] SET_LEVEL_CONFIG - Configure speed, layout, colors for CURRENT_LEVEL
+SET_LEVEL_CONFIG PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH SI
+    PUSH DI
+
+    MOV BYTE PTR BONUSES_SPAWNED, 0
+    MOV BYTE PTR LIVES_SPAWNED, 0
+
+    XOR BX, BX
+    MOV BL, BYTE PTR CURRENT_LEVEL
+    DEC BX
+    SHL BX, 1
+    MOV AX, LevelSpeedDX[BX]
+    MOV WORD PTR BALL_DX, AX
+    MOV AX, LevelSpeedDY[BX]
+    MOV WORD PTR BALL_DY, AX
+
+    MOV AX, WORD PTR ORIG_PADDLE_W
+    MOV WORD PTR PADDLE_WIDTH, AX
+
+    MOV WORD PTR BALL_POS_X, 158
+    MOV WORD PTR BALL_POS_Y, 181
+    MOV WORD PTR PADDLE_POS_X, 135
+    MOV WORD PTR PADDLE_PREV_X, 135
+
+    MOV BYTE PTR GAME_RUNNING, 1
+    MOV BYTE PTR GAME_STARTED, 0
+    MOV BYTE PTR GAME_PAUSED, 0
+
+    MOV AL, BYTE PTR CURRENT_LEVEL
+    CMP AL, 2
+    JE @@SLC_L2
+    CMP AL, 3
+    JE @@SLC_L3
+    MOV WORD PTR BrickColorPtr, OFFSET BrickColorsL1
+    MOV WORD PTR LayoutPtr, OFFSET LayoutL1
+    JMP @@SLC_COPY
+
+@@SLC_L2:
+    MOV WORD PTR BrickColorPtr, OFFSET BrickColorsL2
+    MOV WORD PTR LayoutPtr, OFFSET LayoutL2
+    JMP @@SLC_COPY
+
+@@SLC_L3:
+    MOV WORD PTR BrickColorPtr, OFFSET BrickColorsL3
+    MOV WORD PTR LayoutPtr, OFFSET LayoutL3
+
+@@SLC_COPY:
+    MOV SI, WORD PTR LayoutPtr
+    LEA DI, BRICK_ALIVE
+    MOV CX, 56
+@@SLC_COPY_LOOP:
+    MOV AL, [SI]
+    MOV [DI], AL
+    INC SI
+    INC DI
+    LOOP @@SLC_COPY_LOOP
+
+    MOV BYTE PTR BONUS_ACTIVE, 0
+    MOV BYTE PTR BONUS_EFFECT, 0
+    MOV WORD PTR BONUS_TIMER, 0
+
+    MOV WORD PTR HUD_SCORE_CACHED, 0FFFFh
+    MOV BYTE PTR HUD_LIVES_CACHED, 0FFh
+
+    POP DI
+    POP SI
+    POP CX
+    POP BX
+    POP AX
+    RET
+SET_LEVEL_CONFIG ENDP
+
+
+; [Iter1] DRAW_STATIC_LAYOUT - Clear screen, draw HUD, bricks, paddle, ball
+DRAW_STATIC_LAYOUT PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+
+    CLD
+    XOR DI, DI
+    MOV AL, C_DEEP_BLUE
+    MOV CX, 64000
+    REP STOSB
+
+    PUSH_RECT 0, 15, 320, 2, C_HUD_SEP
+
+    CALL UPDATE_HUD
+
+    CALL DRAW_BRICK_GRID
+
+    PUSH_RECT PADDLE_POS_X, PADDLE_POS_Y, PADDLE_WIDTH, PADDLE_HEIGHT, C_CYAN
+
+    PUSH_RECT BALL_POS_X, BALL_POS_Y, BALL_SIZE_W, BALL_SIZE_H, C_WHITE
+
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+DRAW_STATIC_LAYOUT ENDP
+
+
+; [Iter2] GAME_LOOP - Main loop; exits when GAME_RUNNING = 0
+; [Iter3/Bonus] Added pause system with resume/quit options
+GAME_LOOP PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+
+@@GL_LOOP:
+    ; --- Pause check ---
+    CMP BYTE PTR GAME_PAUSED, 1
+    JE @@GL_PAUSED
+
+    CALL READ_INPUT
+    CALL MOVE_PADDLE
+    CALL ERASE_BALL
+    CALL UPDATE_BALL_POSITION
+    CALL CHECK_COLLISIONS
+    CALL DRAW_BALL
+    CALL UPDATE_BONUS
+    CALL UPDATE_EFFECT_TIMER
+    CALL UPDATE_HUD
+    CALL APPLY_DELAY
+    CALL CHECK_END_CONDITIONS
+
+    CMP BYTE PTR GAME_RUNNING, 1
+    JE @@GL_LOOP
+    JMP @@GL_EXIT
+
+@@GL_PAUSED:
+    MOV AH, 01h
+    INT 16h
+    JZ @@GL_PAUSED
+    MOV AH, 00h
+    INT 16h
+    CMP AL, 'r'
+    JE @@GL_UNPAUSE
+    CMP AL, 'R'
+    JE @@GL_UNPAUSE
+    CMP AL, 'q'
+    JE @@GL_QUIT_MENU
+    CMP AL, 'Q'
+    JE @@GL_QUIT_MENU
+    CMP AL, 1Bh
+    JE @@GL_QUIT_MENU
+    JMP @@GL_PAUSED
+@@GL_QUIT_MENU:
+    ; [Iter3/Bonus] Save score to file when quitting via pause menu
+    CALL UPDATE_HIGH_SCORES
+    MOV BYTE PTR GAME_RUNNING, 0
+    JMP @@GL_EXIT
+@@GL_UNPAUSE:
+    PUSH_RECT 50, 70, 220, 60, C_DEEP_BLUE
+    MOV BYTE PTR GAME_PAUSED, 0
+    CALL DRAW_BRICK_GRID
+    PUSH_RECT PADDLE_POS_X, PADDLE_POS_Y, PADDLE_WIDTH, PADDLE_HEIGHT, C_CYAN
+    JMP @@GL_LOOP
+
+@@GL_EXIT:
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+GAME_LOOP ENDP
+
+
+; [Iter2] READ_INPUT - Handle keyboard input for paddle movement
+; [Iter3/Bonus] Added pause key (P/ESC) and mouse support
+READ_INPUT PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+
+    MOV AX, WORD PTR PADDLE_POS_X
+    MOV WORD PTR PADDLE_PREV_X, AX
+    XOR CX, CX
+
+@@RI_NEXT_KEY:
+    MOV AH, 01h
+    INT 16h
+    JNZ @@RI_HAS_KEY
+    JMP @@RI_APPLY_INTENT
+@@RI_HAS_KEY:
+
+    MOV AH, 00h
+    INT 16h
+
+    CMP AL, 1Bh
+    JE @@RI_PAUSE
+    CMP AL, 'p'
+    JE @@RI_PAUSE
+    CMP AL, 'P'
+    JE @@RI_PAUSE
+    JMP @@RI_NOT_P
+@@RI_PAUSE:
+    MOV BYTE PTR GAME_PAUSED, 1
+    PUSH_RECT 50, 70, 220, 60, 0
+    PUSH_RECT 50, 70, 220, 2, C_BRIGHT_MAG
+    PUSH_RECT 50, 128, 220, 2, C_BRIGHT_MAG
+    PUSH_RECT 50, 72, 2, 56, C_BRIGHT_MAG
+    PUSH_RECT 268, 72, 2, 56, C_BRIGHT_MAG
+    LEA SI, MsgPaused
+    MOV BX, 116
+    MOV DX, 80
+    MOV AH, C_BRIGHT_YELLOW
+    CALL DRAW_STRING
+    LEA SI, MsgResume
+    MOV BX, 120
+    MOV DX, 98
+    MOV AH, C_CYAN
+    CALL DRAW_STRING
+    LEA SI, MsgQuit
+    MOV BX, 96
+    MOV DX, 112
+    MOV AH, 04h
+    CALL DRAW_STRING
+    JMP @@RI_APPLY_INTENT
+@@RI_NOT_P:
+
+    CMP AH, 4Bh
+    JE @@RI_LEFT
+    CMP AL, 'A'
+    JE @@RI_LEFT
+    CMP AL, 'a'
+    JE @@RI_LEFT
+
+    CMP AH, 4Dh
+    JE @@RI_RIGHT
+    CMP AL, 'D'
+    JE @@RI_RIGHT
+    CMP AL, 'd'
+    JE @@RI_RIGHT
+    JMP @@RI_NEXT_KEY
+
+@@RI_RIGHT:
+    MOV CX, 1
+    MOV BYTE PTR GAME_STARTED, 1
+    JMP @@RI_NEXT_KEY
+
+@@RI_LEFT:
+    MOV CX, -1
+    MOV BYTE PTR GAME_STARTED, 1
+    JMP @@RI_NEXT_KEY
+
+@@RI_APPLY_INTENT:
+    CMP CX, 0
+    JE @@RI_DONE
+    CMP CX, 1
+    JE @@RI_DO_RIGHT
+
+@@RI_DO_LEFT:
+    MOV AX, WORD PTR PADDLE_STEP
+    SUB WORD PTR PADDLE_POS_X, AX
+    JMP @@RI_DONE
+
+@@RI_DO_RIGHT:
+    MOV AX, WORD PTR PADDLE_STEP
+    ADD WORD PTR PADDLE_POS_X, AX
+
+@@RI_DONE:
+    ; --- Mouse input ---
+    CMP BYTE PTR MOUSE_ACTIVE, 0
+    JE @@RI_EXIT
+
+    PUSH DX
+    MOV AX, 0003h
+    INT 33h
+
+    SHR CX, 1
+
+    CMP CX, WORD PTR MOUSE_PREV_X
+    JE @@RI_CHK_BTN
+
+    MOV WORD PTR MOUSE_PREV_X, CX
+
+    MOV AX, CX
+    MOV BX, WORD PTR PADDLE_WIDTH
+    SHR BX, 1
+    SUB AX, BX
+    MOV WORD PTR PADDLE_POS_X, AX
+    MOV BYTE PTR GAME_STARTED, 1
+
+@@RI_CHK_BTN:
+    TEST BX, 1
+    JZ @@RI_MOUSE_END
+    MOV BYTE PTR GAME_STARTED, 1
+
+@@RI_MOUSE_END:
+    POP DX
+
+@@RI_EXIT:
+    POP CX
+    POP BX
+    POP AX
+    RET
+READ_INPUT ENDP
+
+
+; [Iter2] MOVE_PADDLE - Clamp paddle to screen bounds and redraw
+MOVE_PADDLE PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+
+    CMP WORD PTR PADDLE_POS_X, 0
+    JGE @@MP_CHK_RIGHT
+    MOV WORD PTR PADDLE_POS_X, 0
+
+@@MP_CHK_RIGHT:
+    MOV AX, 320
+    SUB AX, WORD PTR PADDLE_WIDTH
+    CMP WORD PTR PADDLE_POS_X, AX
+    JLE @@MP_CHECK_MOVED
+    MOV WORD PTR PADDLE_POS_X, AX
+
+@@MP_CHECK_MOVED:
+    MOV AX, WORD PTR PADDLE_POS_X
+    CMP AX, WORD PTR PADDLE_PREV_X
+    JE @@MP_DONE
+
+    PUSH_RECT PADDLE_PREV_X, PADDLE_POS_Y, PADDLE_WIDTH, PADDLE_HEIGHT, C_DEEP_BLUE
+    PUSH_RECT PADDLE_POS_X, PADDLE_POS_Y, PADDLE_WIDTH, PADDLE_HEIGHT, C_CYAN
+
+    MOV AX, WORD PTR PADDLE_POS_X
+    MOV WORD PTR PADDLE_PREV_X, AX
+
+@@MP_DONE:
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+MOVE_PADDLE ENDP
+
+
+; [Iter2] ERASE_BALL - Erase ball with brick repair in brick zone
+ERASE_BALL PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+
+    MOV AX, WORD PTR BALL_POS_Y
+    MOV BX, WORD PTR BALL_SIZE_H
+    SHR BX, 1
+    ADD AX, BX
+    MOV BX, AX
+
+    MOV AX, WORD PTR HUD_SEP_Y
+    CMP BX, AX
+    JL @@EB_USE_BG
+    MOV CX, AX
+    ADD CX, 2
+    CMP BX, CX
+    JGE @@EB_USE_BG
+
+    PUSH_RECT BALL_POS_X, BALL_POS_Y, BALL_SIZE_W, BALL_SIZE_H, C_HUD_SEP
+    JMP @@EB_REPAIR
+
+@@EB_USE_BG:
+    PUSH_RECT BALL_POS_X, BALL_POS_Y, BALL_SIZE_W, BALL_SIZE_H, C_DEEP_BLUE
+
+@@EB_REPAIR:
+    CMP WORD PTR BALL_POS_Y, 18
+    JL @@EB_DONE
+    CMP WORD PTR BALL_POS_Y, 72
+    JG @@EB_DONE
+    CALL DRAW_BRICK_GRID
+
+@@EB_DONE:
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+ERASE_BALL ENDP
+
+
+; [Iter2] UPDATE_BALL_POSITION - Move ball or sit on paddle if not started
+UPDATE_BALL_POSITION PROC NEAR
+    PUSH AX
+    PUSH BX
+
+    CMP BYTE PTR GAME_STARTED, 0
+    JE @@UBP_WAIT
+
+    MOV AX, WORD PTR BALL_DX
+    ADD WORD PTR BALL_POS_X, AX
+    MOV AX, WORD PTR BALL_DY
+    ADD WORD PTR BALL_POS_Y, AX
+    JMP @@UBP_DONE
+
+@@UBP_WAIT:
+    MOV AX, WORD PTR PADDLE_POS_X
+    ADD AX, 23
+    MOV WORD PTR BALL_POS_X, AX
+    MOV WORD PTR BALL_POS_Y, 181
+
+@@UBP_DONE:
+    POP BX
+    POP AX
+    RET
+UPDATE_BALL_POSITION ENDP
+
+
+; DRAW_BALL
+DRAW_BALL PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH_RECT BALL_POS_X, BALL_POS_Y, BALL_SIZE_W, BALL_SIZE_H, C_WHITE
+    POP BX
+    POP AX
+    RET
+DRAW_BALL ENDP
+
+
+; [Iter2] CHECK_COLLISIONS - Master collision dispatcher
+CHECK_COLLISIONS PROC NEAR
+    PUSH AX
+
+    MOV BYTE PTR COLLISION_TYPE, 0
+
+    CALL CHECK_WALL_COLLISION
+
+    CMP BYTE PTR COLLISION_TYPE, 0
+    JNE @@CC_DONE
+    CALL CHECK_PADDLE_COLLISION
+
+    CMP BYTE PTR COLLISION_TYPE, 0
+    JNE @@CC_DONE
+    CALL CHECK_BRICK_COLLISION
+
+@@CC_DONE:
+    POP AX
+    RET
+CHECK_COLLISIONS ENDP
+
+
+; [Iter2] CHECK_WALL_COLLISION - Reflect ball off walls, handle floor miss
+CHECK_WALL_COLLISION PROC NEAR
+    PUSH AX
+    PUSH BX
+
+    CMP WORD PTR BALL_POS_X, 0
+    JGE @@CW_CHK_RIGHT
+    NEG WORD PTR BALL_DX
+    MOV WORD PTR BALL_POS_X, 0
+    MOV BYTE PTR COLLISION_TYPE, 1
+    JMP @@CW_DONE
+
+@@CW_CHK_RIGHT:
+    MOV AX, 316
+    CMP WORD PTR BALL_POS_X, AX
+    JLE @@CW_CHK_TOP
+    NEG WORD PTR BALL_DX
+    MOV WORD PTR BALL_POS_X, AX
+    MOV BYTE PTR COLLISION_TYPE, 1
+    JMP @@CW_DONE
+
+@@CW_CHK_TOP:
+    MOV AX, 17
+    CMP WORD PTR BALL_POS_Y, AX
+    JGE @@CW_CHK_BOTTOM
+    NEG WORD PTR BALL_DY
+    MOV WORD PTR BALL_POS_Y, AX
+    MOV BYTE PTR COLLISION_TYPE, 1
+    JMP @@CW_DONE
+
+@@CW_CHK_BOTTOM:
+    MOV AX, 195
+    CMP WORD PTR BALL_POS_Y, AX
+    JLE @@CW_DONE
+    CALL HANDLE_LOSS_OF_LIFE
+
+@@CW_DONE:
+    POP BX
+    POP AX
+    RET
+CHECK_WALL_COLLISION ENDP
+
+
+; [Iter2] CHECK_PADDLE_COLLISION - Bounce ball off paddle
+CHECK_PADDLE_COLLISION PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+
+    MOV AX, WORD PTR BALL_POS_X
+    ADD AX, WORD PTR BALL_SIZE_W
+    CMP AX, WORD PTR PADDLE_POS_X
+    JLE @@CP_NO_HIT
+
+    MOV AX, WORD PTR PADDLE_POS_X
+    ADD AX, WORD PTR PADDLE_WIDTH
+    CMP WORD PTR BALL_POS_X, AX
+    JGE @@CP_NO_HIT
+
+    MOV AX, WORD PTR BALL_POS_Y
+    ADD AX, WORD PTR BALL_SIZE_H
+    CMP AX, WORD PTR PADDLE_POS_Y
+    JLE @@CP_NO_HIT
+
+    MOV AX, WORD PTR PADDLE_POS_Y
+    ADD AX, WORD PTR PADDLE_HEIGHT
+    CMP WORD PTR BALL_POS_Y, AX
+    JGE @@CP_NO_HIT
+
+    CMP WORD PTR BALL_DY, 0
+    JLE @@CP_NO_HIT
+
+    MOV AX, WORD PTR PADDLE_POS_Y
+    SUB AX, WORD PTR BALL_SIZE_H
+    MOV WORD PTR BALL_POS_Y, AX
+    NEG WORD PTR BALL_DY
+    MOV BYTE PTR COLLISION_TYPE, 2
+    JMP @@CP_DONE
+
+@@CP_NO_HIT:
+@@CP_DONE:
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+CHECK_PADDLE_COLLISION ENDP
+
+
+; [Iter2] CHECK_BRICK_COLLISION - Break bricks and add score
+; [Iter3] Added random bonus spawning on brick break
+CHECK_BRICK_COLLISION PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+
+    MOV AX, WORD PTR BALL_POS_X
+    MOV BX, WORD PTR BALL_SIZE_W
+    SHR BX, 1
+    ADD AX, BX
+    MOV WORD PTR BRICK_X, AX
+
+    MOV AX, WORD PTR BALL_POS_Y
+    MOV BX, WORD PTR BALL_SIZE_H
+    SHR BX, 1
+    ADD AX, BX
+    MOV WORD PTR BRICK_Y, AX
+
+    MOV AX, WORD PTR BRICK_X
+    SUB AX, WORD PTR BRICK_MARGIN_X
+    CMP AX, 0
+    JL @@CB_NO_HIT
+    XOR DX, DX
+    DIV WORD PTR BRICK_STEP_X
+    MOV BX, AX
+    CMP BX, WORD PTR BRICK_COLS
+    JGE @@CB_NO_HIT
+
+    MOV AX, WORD PTR BRICK_Y
+    SUB AX, WORD PTR BRICK_START_Y
+    CMP AX, 0
+    JL @@CB_NO_HIT
+    XOR DX, DX
+    DIV WORD PTR BRICK_STEP_Y
+    MOV CX, AX
+    CMP CX, WORD PTR BRICK_ROWS
+    JGE @@CB_NO_HIT
+
+    MOV AX, CX
+    MOV DX, WORD PTR BRICK_COLS
+    MUL DX
+    ADD AX, BX
+    MOV SI, AX
+
+    CMP BRICK_ALIVE[SI], 1
+    JNE @@CB_NO_HIT
+
+    MOV BRICK_ALIVE[SI], 0
+    CALL ERASE_BRICK_AT_GRID_CELL
+    ADD WORD PTR PLAYER_SCORE, 10
+    NEG WORD PTR BALL_DY
+    MOV BYTE PTR COLLISION_TYPE, 3
+
+    CALL GET_RANDOM
+    MOV AL, AH
+    XOR AH, AH
+    CMP AX, 64
+    JGE @@CB_NO_BONUS
+
+    CMP BYTE PTR BONUS_ACTIVE, 0
+    JNE @@CB_NO_BONUS
+
+    CALL SPAWN_BONUS
+
+@@CB_NO_BONUS:
+    JMP @@CB_DONE
+
+@@CB_NO_HIT:
+@@CB_DONE:
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+CHECK_BRICK_COLLISION ENDP
+
+
+
+
+
+; [Iter1] DRAW_BRICK_GRID - Draw all alive bricks with level-specific colors
+DRAW_BRICK_GRID PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+
+    MOV SI, 0
+
+@@DBG_LOOP:
+    CMP SI, 56
+    JGE @@DBG_DONE
+
+    MOV AX, SI
+    XOR DX, DX
+    MOV BX, WORD PTR BRICK_COLS
+    DIV BX
+    MOV BX, DX
+    MOV CX, AX
+
+    CMP BRICK_ALIVE[SI], 1
+    JNE @@DBG_NEXT
+
+    MOV AX, BX
+    MUL WORD PTR BRICK_STEP_X
+    ADD AX, WORD PTR BRICK_MARGIN_X
+    MOV WORD PTR BRICK_X, AX
+
+    MOV AX, CX
+    MUL WORD PTR BRICK_STEP_Y
+    ADD AX, WORD PTR BRICK_START_Y
+    MOV WORD PTR BRICK_Y, AX
+
+    PUSH BX
+    MOV BX, WORD PTR BrickColorPtr
+    MOV AX, CX
+    ADD BX, AX
+    MOV AL, [BX]
+    XOR AH, AH
+    POP BX
+
+    PUSH_RECT BRICK_X, BRICK_Y, BRICK_GRID_W, BRICK_GRID_H, AX
+
+@@DBG_NEXT:
+    INC SI
+    JMP @@DBG_LOOP
+
+@@DBG_DONE:
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+DRAW_BRICK_GRID ENDP
+
+
+; ERASE_BRICK_AT_GRID_CELL  - BX=col, CX=row
+ERASE_BRICK_AT_GRID_CELL PROC NEAR
+    PUSH AX
+    PUSH DX
+
+    MOV AX, BX
+    MUL WORD PTR BRICK_STEP_X
+    ADD AX, WORD PTR BRICK_MARGIN_X
+    MOV WORD PTR BRICK_X, AX
+
+    MOV AX, CX
+    MUL WORD PTR BRICK_STEP_Y
+    ADD AX, WORD PTR BRICK_START_Y
+    MOV WORD PTR BRICK_Y, AX
+
+    PUSH_RECT BRICK_X, BRICK_Y, BRICK_GRID_W, BRICK_GRID_H, C_DEEP_BLUE
+
+    POP DX
+    POP AX
+    RET
+ERASE_BRICK_AT_GRID_CELL ENDP
+
+
+; [Iter2] UPDATE_HUD - Cached HUD update (score, lives, level, name)
+UPDATE_HUD PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+
+    MOV AX, WORD PTR PLAYER_SCORE
+    CMP AX, WORD PTR HUD_SCORE_CACHED
+    JNE @@UH_DO_REDRAW
+
+    MOV AL, BYTE PTR PLAYER_LIVES
+    CMP AL, BYTE PTR HUD_LIVES_CACHED
+    JNE @@UH_DO_REDRAW
+    JMP @@UH_DONE
+
+@@UH_DO_REDRAW:
+    MOV AX, WORD PTR PLAYER_SCORE
+    MOV WORD PTR HUD_SCORE_CACHED, AX
+    MOV AL, BYTE PTR PLAYER_LIVES
+    MOV BYTE PTR HUD_LIVES_CACHED, AL
+
+    PUSH_RECT 0, 2, 320, 12, C_DEEP_BLUE
+
+    MOV AX, WORD PTR PLAYER_SCORE
+    MOV BX, 1000
+    XOR DX, DX
+    DIV BX
+    ADD AL, '0'
+    MOV BYTE PTR HudScore+7, AL
+    MOV AX, DX
+    MOV BX, 100
+    XOR DX, DX
+    DIV BX
+    ADD AL, '0'
+    MOV BYTE PTR HudScore+8, AL
+    MOV AX, DX
+    MOV BX, 10
+    XOR DX, DX
+    DIV BX
+    ADD AL, '0'
+    MOV BYTE PTR HudScore+9, AL
+    ADD DL, '0'
+    MOV BYTE PTR HudScore+10, DL
+
+    MOV AL, BYTE PTR PLAYER_LIVES
+    ADD AL, '0'
+    MOV BYTE PTR HudLives+7, AL
+
+    MOV AL, BYTE PTR CURRENT_LEVEL
+    ADD AL, '0'
+    MOV BYTE PTR HudLevel+5, AL
+
+    LEA SI, HudScore
+    MOV BX, 5
+    MOV DX, 4
+    MOV AH, C_WHITE
+    CALL DRAW_STRING
+
+    LEA SI, HudLives
+    MOV BX, 100
+    MOV DX, 4
+    MOV AH, C_WHITE
+    CALL DRAW_STRING
+
+    LEA SI, HudLevel
+    MOV BX, 180
+    MOV DX, 4
+    MOV AH, C_WHITE
+    CALL DRAW_STRING
+
+    LEA SI, PLAYER_NAME
+    MOV BX, 240
+    MOV DX, 4
+    MOV AH, C_CYAN
+    CALL DRAW_STRING
+
+@@UH_DONE:
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+UPDATE_HUD ENDP
+
+
+; APPLY_DELAY
+APPLY_DELAY PROC NEAR
+    PUSH AX
+    PUSH CX
+
+    MOV CX, 2
+
+@@AD_OUTER:
+    PUSH CX
+    XOR CX, CX
+@@AD_INNER:
+    LOOP @@AD_INNER
+    POP CX
+    LOOP @@AD_OUTER
+
+    POP CX
+    POP AX
+    RET
+APPLY_DELAY ENDP
+
+
+; [Iter2] CHECK_END_CONDITIONS - Check for game over or level clear
+; [Iter3] Added multi-level progression (Level 1 -> 2 -> 3 -> Win)
+CHECK_END_CONDITIONS PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH SI
+
+    CMP BYTE PTR PLAYER_LIVES, 0
+    JNE @@CEC_CHK_WIN
+
+    MOV BYTE PTR GAME_STATE, 1
+    MOV BYTE PTR GAME_RUNNING, 0
+    CALL SHOW_GAME_OVER
+    JMP @@CEC_DONE
+
+@@CEC_CHK_WIN:
+    MOV CX, 56
+    MOV BX, 0
+    MOV AL, 0
+@@CEC_BR_LOOP:
+    CMP BRICK_ALIVE[BX], 1
+    JNE @@CEC_BR_NEXT
+    MOV AL, 1
+    JMP @@CEC_BR_FOUND
+@@CEC_BR_NEXT:
+    INC BX
+    LOOP @@CEC_BR_LOOP
+
+@@CEC_BR_FOUND:
+    CMP AL, 1
+    JE @@CEC_DONE
+
+    MOV AL, BYTE PTR CURRENT_LEVEL
+    CMP AL, 3
+    JE @@CEC_YOU_WIN
+
+    INC BYTE PTR CURRENT_LEVEL
+    CALL SHOW_LEVEL_TRANSITION
+    CALL SET_LEVEL_CONFIG
+    CALL DRAW_STATIC_LAYOUT
+    MOV BYTE PTR GAME_RUNNING, 1
+    JMP @@CEC_DONE
+
+@@CEC_YOU_WIN:
+    MOV BYTE PTR GAME_STATE, 2
+    MOV BYTE PTR GAME_RUNNING, 0
+    CALL SHOW_WIN_SCREEN
+
+@@CEC_DONE:
+    POP SI
+    POP CX
+    POP BX
+    POP AX
+    RET
+CHECK_END_CONDITIONS ENDP
+
+
+; [Iter3] SHOW_LEVEL_TRANSITION - Brief banner between levels
+SHOW_LEVEL_TRANSITION PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+
+    PUSH AX
+    PUSH DI
+    CLD
+    XOR DI, DI
+    MOV AL, C_DEEP_BLUE
+    MOV CX, 64000
+    REP STOSB
+    POP DI
+    POP AX
+
+    CALL DRAW_BORDER
+
+    PUSH_RECT 40, 60, 240, 80, 0
+    PUSH_RECT 40, 60, 240, 2, C_BRIGHT_MAG
+    PUSH_RECT 40, 138, 240, 2, C_BRIGHT_MAG
+    PUSH_RECT 40, 62, 2, 76, C_BRIGHT_MAG
+    PUSH_RECT 278, 62, 2, 76, C_BRIGHT_MAG
+
+    MOV AL, BYTE PTR CURRENT_LEVEL
+    CMP AL, 2
+    JNE @@SLT_L3
+    LEA SI, MsgLevel2
+    MOV BX, 88
+    JMP @@SLT_DRAW
+@@SLT_L3:
+    LEA SI, MsgLevel3
+    MOV BX, 80
+@@SLT_DRAW:
+    MOV DX, 85
+    MOV AH, C_BRIGHT_YELLOW
+    CALL DRAW_STRING
+
+    LEA SI, HudScore
+    MOV BX, 120
+    MOV DX, 105
+    MOV AH, C_WHITE
+    CALL DRAW_STRING
+
+    LEA SI, MsgPressKey
+    MOV BX, 96
+    MOV DX, 122
+    MOV AH, 07h
+    CALL DRAW_STRING
+
+    MOV BYTE PTR BONUS_ACTIVE, 0
+    MOV BYTE PTR BONUS_EFFECT, 0
+    MOV WORD PTR BONUS_TIMER, 0
+
+    MOV AH, 00h
+    INT 16h
+
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+SHOW_LEVEL_TRANSITION ENDP
+
+
+; [Iter2] SHOW_GAME_OVER - Display game over screen and save score
+; [Iter3/Bonus] Calls UPDATE_HIGH_SCORES to save to HISCORE.DAT
+SHOW_GAME_OVER PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+
+    PUSH_RECT 60, 75, 200, 60, 0
+
+    LEA SI, MsgGameOver
+    MOV BX, 124
+    MOV DX, 85
+    MOV AH, 04h
+    CALL DRAW_STRING
+
+    LEA SI, HudScore
+    MOV BX, 105
+    MOV DX, 100
+    MOV AH, C_WHITE
+    CALL DRAW_STRING
+
+    LEA SI, MsgPressKey
+    MOV BX, 96
+    MOV DX, 116
+    MOV AH, 07h
+    CALL DRAW_STRING
+
+    CALL UPDATE_HIGH_SCORES
+
+    MOV AH, 00h
+    INT 16h
+
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+SHOW_GAME_OVER ENDP
+
+
+; [Iter3] SHOW_WIN_SCREEN - Display victory screen and save score
+SHOW_WIN_SCREEN PROC NEAR
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+
+    CLD
+    XOR DI, DI
+    MOV AL, C_DEEP_BLUE
+    MOV CX, 64000
+    REP STOSB
+
+    CALL DRAW_BORDER
+
+    PUSH_RECT 70, 55, 180, 50, 0
+
+    LEA SI, MsgYouWin
+    MOV BX, 120
+    MOV DX, 65
+    MOV AH, 0Ah
+    CALL DRAW_STRING
+
+    LEA SI, HudScore
+    MOV BX, 110
+    MOV DX, 82
+    MOV AH, C_BRIGHT_YELLOW
+    CALL DRAW_STRING
+
+    LEA SI, MsgPressKey
+    MOV BX, 96
+    MOV DX, 96
+    MOV AH, 07h
+    CALL DRAW_STRING
+
+    PUSH_RECT  20, 120, 18, 8, C_CYAN
+    PUSH_RECT  45, 135, 18, 8, 0Ah
+    PUSH_RECT  70, 120, 18, 8, 0Eh
+    PUSH_RECT 232, 120, 18, 8, C_CYAN
+    PUSH_RECT 257, 135, 18, 8, 0Ah
+    PUSH_RECT 282, 120, 18, 8, 0Eh
+
+    CALL UPDATE_HIGH_SCORES
+
+    MOV AH, 00h
+    INT 16h
+
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+SHOW_WIN_SCREEN ENDP
+
+
+; [Iter2] HANDLE_LOSS_OF_LIFE - Decrement lives, reset ball/paddle
+; [Iter3/Bonus] Added death sound and bonus cleanup
+HANDLE_LOSS_OF_LIFE PROC NEAR
+    PUSH AX
+
+    CMP BYTE PTR BONUS_ACTIVE, 0
+    JE @@HLL_NO_BONUS
+    PUSH_RECT BONUS_X, BONUS_Y, BonusSizeW, BonusSizeH, C_DEEP_BLUE
+    MOV BYTE PTR BONUS_ACTIVE, 0
+@@HLL_NO_BONUS:
+
+    PUSH_RECT PADDLE_POS_X, PADDLE_POS_Y, PADDLE_WIDTH, PADDLE_HEIGHT, C_DEEP_BLUE
+
+    DEC BYTE PTR PLAYER_LIVES
+    MOV BYTE PTR HUD_LIVES_CACHED, 0FFh
+
+    CALL PLAY_DEATH_SOUND
+
+    CALL UNDO_BONUS_EFFECT
+
+    MOV WORD PTR BALL_POS_X, 158
+    MOV WORD PTR BALL_POS_Y, 181
+    PUSH BX
+    XOR BX, BX
+    MOV BL, BYTE PTR CURRENT_LEVEL
+    DEC BX
+    SHL BX, 1
+    MOV AX, LevelSpeedDX[BX]
+    MOV WORD PTR BALL_DX, AX
+    MOV AX, LevelSpeedDY[BX]
+    MOV WORD PTR BALL_DY, AX
+    POP BX
+
+    MOV WORD PTR PADDLE_POS_X, 135
+    MOV WORD PTR PADDLE_PREV_X, 135
+    MOV WORD PTR PADDLE_WIDTH, 50
+    MOV WORD PTR ORIG_PADDLE_W, 50
+
+    PUSH_RECT PADDLE_POS_X, PADDLE_POS_Y, PADDLE_WIDTH, PADDLE_HEIGHT, C_CYAN
+
+    MOV BYTE PTR GAME_STARTED, 0
+
+    POP AX
+    RET
+HANDLE_LOSS_OF_LIFE ENDP
